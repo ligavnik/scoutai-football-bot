@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
 ScoutAI — Football Analytics Bot
-Data: api-football.com v3 (free: 100 req/day)
-AI:   Groq API (free tier)
-Host: Railway.app (free)
+Keys live on the SERVER (env vars) — users register nothing.
+Smart caching = no wasted API requests on refresh.
 
 LOCAL:
   pip install -r requirements.txt
-  python server.py  →  open http://localhost:5000
+  set FD_KEY=your_football_data_key
+  set GROQ_API_KEY=your_groq_key
+  python server.py  →  http://localhost:5000
 
-DEPLOY:
-  Push to GitHub → connect Railway.app → done.
+RAILWAY DEPLOY:
+  Set env vars in Railway dashboard:
+    FD_KEY        = your football-data.org key
+    GROQ_API_KEY  = your Groq key
+  Push to GitHub → connect Railway → done.
+  Users just open the URL. Zero setup on their end.
 """
 
-import json
-import os
-import re
-import requests
+import json, os, re, time, hashlib, requests
 from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -24,256 +26,239 @@ from flask_cors import CORS
 app = Flask(__name__, static_folder=".")
 CORS(app)
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-AF_BASE    = "https://v3.football.api-sports.io"
-GROQ_BASE  = "https://api.groq.com/openai/v1"
+# ── SERVER-SIDE KEYS (never exposed to users) ─────────────────────────────────
+FD_KEY       = os.environ.get("FD_KEY", "")        # football-data.org
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")  # groq.com
+
+FD_BASE   = "https://api.football-data.org/v4"
+GROQ_BASE = "https://api.groq.com/openai/v1"
 GROQ_MODEL = "llama-3.1-8b-instant"
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-# api-football league IDs
-LEAGUE_IDS = {
-    "PL":  39,   # Premier League
-    "PD":  140,  # La Liga
-    "BL1": 78,   # Bundesliga
-    "SA":  135,  # Serie A
-    "FL1": 61,   # Ligue 1
-    "CL":  2,    # Champions League
-    "WC":  1,    # World Cup
-    "EC":  4,    # Euro Championship
-}
-
-# Auto-detect season: football seasons run Aug-May
-# e.g. 2024/25 season = 2024, 2025/26 season = 2025
+# Auto-detect current season
 _now = datetime.now(timezone.utc)
 CURRENT_SEASON = _now.year if _now.month >= 7 else _now.year - 1
 
+LEAGUE_MAP = {
+    "PL":  {"name": "Premier League",        "id": "PL"},
+    "PD":  {"name": "La Liga",               "id": "PD"},
+    "BL1": {"name": "Bundesliga",            "id": "BL1"},
+    "SA":  {"name": "Serie A",               "id": "SA"},
+    "FL1": {"name": "Ligue 1",               "id": "FL1"},
+    "CL":  {"name": "Champions League",      "id": "CL"},
+    "WC":  {"name": "FIFA World Cup",        "id": "WC"},
+    "EC":  {"name": "European Championship", "id": "EC"},
+}
 
-# ── API-FOOTBALL HELPER ───────────────────────────────────────────────────────
 
-def af_get(path, api_key, params=None):
-    """Call api-football.com v3."""
-    headers = {
-        "x-apisports-key": api_key,
-        "Accept": "application/json",
-    }
-    url = f"{AF_BASE}/{path.lstrip('/')}"
-    r = requests.get(url, headers=headers, params=params or {}, timeout=12)
+# ── CACHE ─────────────────────────────────────────────────────────────────────
+# Persistent file-based cache — survives server restarts.
+# Cache folder is /tmp (works on Railway, Heroku, and locally).
+import pickle, hashlib as _hl
+
+CACHE_DIR = "/tmp/scoutai_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+def _cache_ttl(key):
+    if key.startswith("fixtures"):  return 1800   # 30 min  — fixtures change rarely
+    if key.startswith("standings"): return 3600   # 1 hour
+    if key.startswith("teams"):     return 86400  # 24 hours — squads rarely change
+    if key.startswith("analyze"):   return 1800   # 30 min per match pair
+    if key.startswith("h2h"):       return 86400  # 24 hours
+    if key.startswith("form"):      return 3600   # 1 hour
+    if key.startswith("squad"):     return 86400  # 24 hours
+    return 1800
+
+def _cache_file(key):
+    safe = _hl.md5(key.encode()).hexdigest()
+    return os.path.join(CACHE_DIR, f"{safe}.pkl")
+
+def cache_get(key):
+    path = _cache_file(key)
+    try:
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                ts, data = pickle.load(f)
+            if time.time() - ts < _cache_ttl(key):
+                return data
+            os.remove(path)  # expired
+    except Exception:
+        pass
+    return None
+
+def cache_set(key, data):
+    path = _cache_file(key)
+    try:
+        with open(path, "wb") as f:
+            pickle.dump((time.time(), data), f)
+    except Exception as e:
+        print(f"[cache write error] {e}")
+
+
+# ── FOOTBALL-DATA.ORG ─────────────────────────────────────────────────────────
+
+def fd_get(path, params=None):
+    if not FD_KEY:
+        raise Exception("No football-data.org key configured on server.")
+    headers = {"X-Auth-Token": FD_KEY}
+    r = requests.get(f"{FD_BASE}/{path.lstrip('/')}", headers=headers,
+                     params=params or {}, timeout=12)
     if not r.ok:
-        raise Exception(f"API-Football HTTP {r.status_code}: {r.text[:200]}")
-    data = r.json()
-    # API-Football returns errors inside the response body
-    errors = data.get("errors", {})
-    if errors:
-        msg = list(errors.values())[0] if isinstance(errors, dict) else str(errors)
-        raise Exception(f"API-Football error: {msg}")
-    return data
+        try:    msg = r.json().get("message", f"HTTP {r.status_code}")
+        except: msg = f"HTTP {r.status_code}"
+        raise Exception(msg)
+    return r.json()
 
 
 def find_team(teams, query):
-    """Fuzzy match team name."""
     q = query.lower().strip()
     for t in teams:
-        name = t.get("team", {}).get("name", "")
-        short = t.get("team", {}).get("code", "")
-        for f in [name, short]:
-            if f.lower() == q:
-                return t
+        for f in [t.get("name",""), t.get("shortName",""), t.get("tla","")]:
+            if f.lower() == q: return t
     for t in teams:
-        name = t.get("team", {}).get("name", "")
-        if q in name.lower() or name.lower() in q:
-            return t
+        for f in [t.get("name",""), t.get("shortName","")]:
+            if q in f.lower() or f.lower() in q: return t
     q0 = q.split()[0]
     for t in teams:
-        name = t.get("team", {}).get("name", "")
-        if any(w.startswith(q0) for w in name.lower().split()):
+        if any(w.startswith(q0) for w in t.get("name","").lower().split()):
             return t
     return None
 
 
-def get_form_from_fixtures(fixtures, team_id):
-    """Build W-D-L form string from recent fixtures."""
-    results = []
-    for f in reversed(fixtures):
-        teams = f.get("teams", {})
-        home_id = teams.get("home", {}).get("id")
-        away_id = teams.get("away", {}).get("id")
-        goals   = f.get("goals", {})
-        hg, ag  = goals.get("home"), goals.get("away")
-        if hg is None or ag is None:
-            continue
-        if home_id == team_id:
-            results.append("W" if hg > ag else "L" if hg < ag else "D")
-        elif away_id == team_id:
-            results.append("W" if ag > hg else "L" if ag < hg else "D")
-    return "-".join(results) if results else "N/A"
+def get_form(matches, team_id):
+    out = []
+    for m in reversed(matches):
+        is_home = m.get("homeTeam", {}).get("id") == team_id
+        ft = m.get("score", {}).get("fullTime", {})
+        hg, ag = ft.get("home"), ft.get("away")
+        if hg is None or ag is None: continue
+        gs, gc = (hg, ag) if is_home else (ag, hg)
+        out.append("W" if gs > gc else "L" if gs < gc else "D")
+    return "-".join(out) if out else "N/A"
 
 
-def fmt_recent(fixtures, team_id, n=5):
-    """Format last N results as readable text for AI prompt."""
+def fmt_recent(matches, team_id, n=5):
     lines = []
-    for f in reversed(fixtures[:n]):
-        teams = f.get("teams", {})
-        home  = teams.get("home", {})
-        away  = teams.get("away", {})
-        goals = f.get("goals", {})
-        hg, ag = goals.get("home", "?"), goals.get("away", "?")
-        is_home = home.get("id") == team_id
-        opp  = away.get("name", "?") if is_home else home.get("name", "?")
-        gs   = hg if is_home else ag
-        gc   = ag if is_home else hg
-        try:
-            res = "WIN" if int(gs) > int(gc) else "LOSS" if int(gs) < int(gc) else "DRAW"
-        except Exception:
-            res = "?"
-        date = f.get("fixture", {}).get("date", "")[:10]
+    for m in reversed(matches[:n]):
+        is_home = m.get("homeTeam", {}).get("id") == team_id
+        ft = m.get("score", {}).get("fullTime", {})
+        hg = ft.get("home","?"); ag = ft.get("away","?")
+        gs = hg if is_home else ag; gc = ag if is_home else hg
+        opp = m.get("awayTeam" if is_home else "homeTeam", {}).get("name","?")
+        date = m.get("utcDate","")[:10]
+        try:    res = "WIN" if int(gs)>int(gc) else "LOSS" if int(gs)<int(gc) else "DRAW"
+        except: res = "?"
         lines.append(f"  {res} {gs}-{gc} vs {opp} ({date})")
     return "\n".join(lines) if lines else "  No data"
 
 
 # ── GROQ AI ───────────────────────────────────────────────────────────────────
 
-def groq_chat(messages, groq_key, temperature=0.3, max_tokens=1400, as_json=True):
-    key = groq_key or GROQ_API_KEY
-    if not key:
-        raise Exception("No Groq API key. Get a free key at console.groq.com")
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
+def groq_chat(messages, temperature=0.3, max_tokens=1400, as_json=True):
+    if not GROQ_API_KEY:
+        raise Exception("No Groq API key configured on server.")
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}",
+               "Content-Type": "application/json"}
+    payload = {"model": GROQ_MODEL, "messages": messages,
+               "temperature": temperature, "max_tokens": max_tokens}
     if as_json:
         payload["response_format"] = {"type": "json_object"}
     r = requests.post(f"{GROQ_BASE}/chat/completions", headers=headers,
                       json=payload, timeout=30)
     if not r.ok:
-        try:
-            err = r.json().get("error", {}).get("message", r.text[:300])
-        except Exception:
-            err = r.text[:300]
-        raise Exception(f"Groq API {r.status_code}: {err}")
+        try:    err = r.json().get("error", {}).get("message", r.text[:300])
+        except: err = r.text[:300]
+        raise Exception(f"Groq {r.status_code}: {err}")
     return r.json()["choices"][0]["message"]["content"]
 
 
 def extract_json(text):
     text = text.strip()
     m = re.search(r"```(?:json)?\s*([\s\S]+?)```", text)
-    if m:
-        text = m.group(1).strip()
+    if m: text = m.group(1).strip()
     start = text.find("{")
-    if start == -1:
-        raise ValueError("No JSON object found")
+    if start == -1: raise ValueError("No JSON found")
     depth = end = 0
     for i, ch in enumerate(text[start:], start):
-        if ch == "{":   depth += 1
-        elif ch == "}": depth -= 1
-        if depth == 0:  end = i; break
-    if not end:
-        raise ValueError("Unclosed JSON")
-    return json.loads(text[start:end + 1])
+        if ch == "{": depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0: end = i; break
+    return json.loads(text[start:end+1])
 
 
 # ── AI PREDICTION ─────────────────────────────────────────────────────────────
 
-def ai_predict(data, groq_key):
+def ai_predict(data):
     home_name = data["homeTeam"]["name"]
     away_name = data["awayTeam"]["name"]
     hs  = data.get("homeStanding") or {}
     as_ = data.get("awayStanding") or {}
 
-    # H2H lines
     h2h_lines = []
-    for f in data.get("h2h", [])[:6]:
-        teams  = f.get("teams", {})
-        goals  = f.get("goals", {})
-        date   = f.get("fixture", {}).get("date", "")[:10]
+    for m in data.get("h2h", [])[:6]:
+        ft = m.get("score",{}).get("fullTime",{})
         h2h_lines.append(
-            f"  {teams.get('home',{}).get('name','?')} "
-            f"{goals.get('home','?')}-{goals.get('away','?')} "
-            f"{teams.get('away',{}).get('name','?')} ({date})"
+            f"  {m.get('homeTeam',{}).get('name','?')} "
+            f"{ft.get('home','?')}-{ft.get('away','?')} "
+            f"{m.get('awayTeam',{}).get('name','?')} "
+            f"({m.get('utcDate','')[:10]})"
         )
-    h2h_txt = "\n".join(h2h_lines) or "  No H2H data"
-
-    home_recent = fmt_recent(data.get("homeFixtures", []), data["homeTeam"]["id"])
-    away_recent = fmt_recent(data.get("awayFixtures", []), data["awayTeam"]["id"])
-
-    system_msg = (
-        "You are a professional football analyst with 20 years of experience. "
-        "You make single definitive predictions — never hedge or list multiple options. "
-        "Pick exactly ONE winner based on the data. "
-        "Return ONLY a valid JSON object, no other text."
-    )
+    h2h_txt      = "\n".join(h2h_lines) or "  No H2H data"
+    home_recent  = fmt_recent(data.get("homeMatches",[]), data["homeTeam"]["id"])
+    away_recent  = fmt_recent(data.get("awayMatches",[]), data["awayTeam"]["id"])
 
     prompt = f"""Analyze this match and return your single definitive prediction as JSON.
 
-=== MATCH ===
-{home_name} (HOME) vs {away_name} (AWAY)
+MATCH: {home_name} (HOME) vs {away_name} (AWAY)
 Competition: {data["league"]["name"]}
 
-{home_name}:
-  Position: #{hs.get("rank","?")} | P{hs.get("all",{}).get("played","?")} W{hs.get("all",{}).get("win","?")} D{hs.get("all",{}).get("draw","?")} L{hs.get("all",{}).get("lose","?")}
-  Goals: scored {hs.get("all",{}).get("goals",{}).get("for","?")} conceded {hs.get("all",{}).get("goals",{}).get("against","?")}
-  Points: {hs.get("points","?")} | Form: {hs.get("form","N/A")}
-  Last 5:
-{home_recent}
+{home_name}: #{hs.get("position","?")} | P{hs.get("playedGames","?")} W{hs.get("won","?")} D{hs.get("draw","?")} L{hs.get("lost","?")} | GF:{hs.get("goalsFor","?")} GA:{hs.get("goalsAgainst","?")} | Pts:{hs.get("points","?")} | Form:{data.get("homeForm","?")}
+Last 5:\n{home_recent}
 
-{away_name}:
-  Position: #{as_.get("rank","?")} | P{as_.get("all",{}).get("played","?")} W{as_.get("all",{}).get("win","?")} D{as_.get("all",{}).get("draw","?")} L{as_.get("all",{}).get("lose","?")}
-  Goals: scored {as_.get("all",{}).get("goals",{}).get("for","?")} conceded {as_.get("all",{}).get("goals",{}).get("against","?")}
-  Points: {as_.get("points","?")} | Form: {as_.get("form","N/A")}
-  Last 5:
-{away_recent}
+{away_name}: #{as_.get("position","?")} | P{as_.get("playedGames","?")} W{as_.get("won","?")} D{as_.get("draw","?")} L{as_.get("lost","?")} | GF:{as_.get("goalsFor","?")} GA:{as_.get("goalsAgainst","?")} | Pts:{as_.get("points","?")} | Form:{data.get("awayForm","?")}
+Last 5:\n{away_recent}
 
-H2H (last meetings):
-{h2h_txt}
+H2H:\n{h2h_txt}
 
-Return EXACTLY this JSON:
+Return ONLY this JSON:
 {{
-  "winner": "PICK ONE: {home_name} OR {away_name} OR Draw",
-  "score": "e.g. 2-1",
+  "winner": "EXACTLY {home_name} OR {away_name} OR Draw",
+  "score": "2-1",
   "confidence": "High or Medium or Low",
   "btts": "Yes or No",
   "over25": "Yes or No",
-  "winProbHome": <integer 0-100>,
-  "winProbDraw": <integer 0-100>,
-  "winProbAway": <integer 0-100>,
-  "keyFactor": "The single most decisive reason for your prediction",
-  "analysis": "200 words: why this team wins, form analysis, H2H patterns, tactical edge. Be direct and confident.",
-  "homeStrengths": ["strength based on data", "strength", "strength"],
-  "awayStrengths": ["strength based on data", "strength", "strength"],
-  "riskFactor": "The one thing that could make this prediction wrong"
+  "winProbHome": 45,
+  "winProbDraw": 25,
+  "winProbAway": 30,
+  "keyFactor": "single most decisive reason",
+  "analysis": "200 word expert analysis, direct and confident",
+  "homeStrengths": ["data-based strength","strength","strength"],
+  "awayStrengths": ["data-based strength","strength","strength"],
+  "riskFactor": "what could make this prediction wrong"
 }}
-RULES:
-- winner = exactly "{home_name}" OR "{away_name}" OR "Draw" — nothing else, no slash, no OR
-- winProbHome + winProbDraw + winProbAway must equal exactly 100"""
+Rules: winner = exactly one name or Draw. Probabilities sum to 100."""
 
-    raw = groq_chat(
-        [{"role": "system", "content": system_msg},
-         {"role": "user",   "content": prompt}],
-        groq_key
-    )
-    print(f"[Groq raw]: {raw[:300]}")
+    raw = groq_chat([
+        {"role":"system","content":"You are a professional football analyst. Pick ONE definitive winner. Return only valid JSON."},
+        {"role":"user","content":prompt}
+    ])
     result = extract_json(raw)
 
     # Safety: validate winner
     valid = [home_name, away_name, "Draw"]
     if result.get("winner") not in valid:
-        ph = result.get("winProbHome", 0)
-        pa = result.get("winProbAway", 0)
-        pd = result.get("winProbDraw", 0)
-        result["winner"] = home_name if ph >= pa and ph >= pd else \
-                           away_name if pa >= ph and pa >= pd else "Draw"
+        ph = result.get("winProbHome",0)
+        pa = result.get("winProbAway",0)
+        pd = result.get("winProbDraw",0)
+        result["winner"] = home_name if ph>=pa and ph>=pd else away_name if pa>=ph and pa>=pd else "Draw"
 
     # Normalize probabilities
-    ph = int(result.get("winProbHome", 40))
-    pd = int(result.get("winProbDraw", 25))
-    pa = int(result.get("winProbAway", 35))
-    total = ph + pd + pa
+    ph,pd,pa = int(result.get("winProbHome",40)), int(result.get("winProbDraw",25)), int(result.get("winProbAway",35))
+    total = ph+pd+pa
     if total != 100:
-        result["winProbHome"] = round(ph * 100 / total)
-        result["winProbDraw"] = round(pd * 100 / total)
-        result["winProbAway"] = 100 - result["winProbHome"] - result["winProbDraw"]
+        result["winProbHome"] = round(ph*100/total)
+        result["winProbDraw"] = round(pd*100/total)
+        result["winProbAway"] = 100-result["winProbHome"]-result["winProbDraw"]
 
     return result
 
@@ -287,48 +272,58 @@ def index():
 
 @app.route("/api/status")
 def status():
-    groq_key = request.headers.get("X-Groq-Key", "").strip() or GROQ_API_KEY
+    """Tell the frontend which features are available + cache stats."""
+    # Count cached files and their ages
+    cached_files = []
+    try:
+        for f in os.listdir(CACHE_DIR):
+            fp = os.path.join(CACHE_DIR, f)
+            try:
+                with open(fp, "rb") as fh:
+                    ts, _ = pickle.load(fh)
+                age_min = round((time.time() - ts) / 60)
+                cached_files.append(age_min)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     return jsonify({
-        "groq":    bool(groq_key),
-        "model":   GROQ_MODEL,
-        "message": "Groq ready" if groq_key else "No Groq key — get free key at console.groq.com"
+        "fdReady":    bool(FD_KEY),
+        "groqReady":  bool(GROQ_API_KEY),
+        "season":     CURRENT_SEASON,
+        "cachedItems": len(cached_files),
+        "message":    "OK" if FD_KEY and GROQ_API_KEY else "Some keys missing on server"
     })
 
 
 @app.route("/api/teams")
 def get_teams():
-    """Return teams for a league — used by autocomplete."""
-    af_key    = request.headers.get("X-AF-Key", "").strip()
     league_code = request.args.get("league", "PL")
-    league_id = LEAGUE_IDS.get(league_code, 39)
-    if not af_key:
-        return jsonify({"error": "No API-Football key"}), 400
+    cache_key   = f"teams_{league_code}"
+    cached = cache_get(cache_key)
+    if cached:
+        print(f"[cache HIT] {cache_key}")
+        return jsonify(cached)
     try:
-        data = af_get("teams", af_key, {"league": league_id, "season": CURRENT_SEASON})
-        # Normalise to match old format expected by autocomplete
-        teams = []
-        for item in data.get("response", []):
-            t = item.get("team", {})
-            teams.append({
-                "id":        t.get("id"),
-                "name":      t.get("name", ""),
-                "shortName": t.get("name", ""),
-                "tla":       t.get("code", ""),
-                "crest":     t.get("logo", ""),
-            })
-        return jsonify({"teams": teams})
+        data = fd_get(f"competitions/{league_code}/teams")
+        cache_set(cache_key, data)
+        print(f"[cache SET] {cache_key}")
+        return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
 
 @app.route("/api/fixtures")
 def get_fixtures():
-    """Upcoming scheduled matches across top leagues."""
-    af_key  = request.headers.get("X-AF-Key", "").strip()
     days    = int(request.args.get("days", 7))
     leagues = request.args.get("leagues", "PL,PD,BL1,SA,FL1,CL")
-    if not af_key:
-        return jsonify({"error": "No API-Football key"}), 400
+    cache_key = f"fixtures_{leagues}_{days}_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+
+    cached = cache_get(cache_key)
+    if cached:
+        print(f"[cache HIT] fixtures")
+        return jsonify(cached)
 
     now       = datetime.now(timezone.utc)
     date_from = now.strftime("%Y-%m-%d")
@@ -337,180 +332,139 @@ def get_fixtures():
     all_matches, errors = [], []
     for code in leagues.split(","):
         code = code.strip()
-        lid  = LEAGUE_IDS.get(code)
-        if not lid:
-            continue
         try:
-            data = af_get("fixtures", af_key, {
-                "league": lid, "season": CURRENT_SEASON,
-                "from": date_from, "to": date_to,
-            })
-            total = data.get("results", 0)
-            print(f"[fixtures] {code} season={CURRENT_SEASON} {date_from}→{date_to}: {total} results")
-            for f in data.get("response", []):
-                fix    = f.get("fixture", {})
-                status = fix.get("status", {}).get("short", "")
-                if status in ("1H","HT","2H","ET","BT","P","INT","FT","AET","PEN","WO","CANC","ABD"):
-                    continue
-                lge  = f.get("league", {})
-                home = f.get("teams", {}).get("home", {})
-                away = f.get("teams", {}).get("away", {})
+            data = fd_get(f"competitions/{code}/matches",
+                          {"status": "SCHEDULED", "dateFrom": date_from, "dateTo": date_to})
+            comp = data.get("competition", {})
+            for m in data.get("matches", []):
                 all_matches.append({
-                    "id":      fix.get("id"),
-                    "utcDate": fix.get("date", ""),
-                    "status":  fix.get("status", {}).get("short", ""),
-                    "homeTeam": {
-                        "id":    home.get("id"),
-                        "name":  home.get("name", ""),
-                        "crest": home.get("logo", ""),
-                    },
-                    "awayTeam": {
-                        "id":    away.get("id"),
-                        "name":  away.get("name", ""),
-                        "crest": away.get("logo", ""),
-                    },
+                    "id":       m.get("id"),
+                    "utcDate":  m.get("utcDate",""),
+                    "status":   m.get("status",""),
+                    "homeTeam": m.get("homeTeam",{}),
+                    "awayTeam": m.get("awayTeam",{}),
                     "competition": {
-                        "id":     lid,
-                        "code":   code,
-                        "name":   lge.get("name", code),
-                        "emblem": lge.get("logo", ""),
+                        "id":     comp.get("id", code),
+                        "code":   comp.get("code", code),
+                        "name":   comp.get("name", code),
+                        "emblem": comp.get("emblem",""),
                     },
-                    "matchday": lge.get("round", ""),
+                    "matchday": m.get("matchday"),
                 })
+            print(f"[fixtures] {code}: {len(data.get('matches',[]))} matches")
         except Exception as e:
             errors.append(f"{code}: {e}")
+            print(f"[fixtures ERR] {code}: {e}")
 
-    all_matches.sort(key=lambda m: m.get("utcDate", ""))
-    return jsonify({
-        "matches":  all_matches,
-        "dateFrom": date_from,
-        "dateTo":   date_to,
-        "errors":   errors,
-        "count":    len(all_matches),
-    })
+    all_matches.sort(key=lambda m: m.get("utcDate",""))
+    result = {"matches": all_matches, "dateFrom": date_from, "dateTo": date_to,
+              "errors": errors, "count": len(all_matches)}
+    if all_matches:
+        cache_set(cache_key, result)
+    return jsonify(result)
 
 
 @app.route("/api/analyze", methods=["POST"])
 def analyze():
     body        = request.json or {}
-    af_key      = request.headers.get("X-AF-Key", "").strip()
-    groq_key    = request.headers.get("X-Groq-Key", "").strip()
-    home_query  = body.get("home", "").strip()
-    away_query  = body.get("away", "").strip()
-    league_code = body.get("leagueId",   "PL")
-    league_name = body.get("leagueName", "Premier League")
-    match_date  = body.get("matchDate",  "")
+    home_query  = body.get("home","").strip()
+    away_query  = body.get("away","").strip()
+    league_code = body.get("leagueId","PL")
+    league_name = body.get("leagueName","Premier League")
+    match_date  = body.get("matchDate","")
     use_ai      = body.get("useAI", True)
 
-    if not af_key:
-        return jsonify({"error": "API-Football key required"}), 400
     if not home_query or not away_query:
         return jsonify({"error": "Both team names required"}), 400
+    if not FD_KEY:
+        return jsonify({"error": "Football data key not configured on server."}), 500
 
-    league_id = LEAGUE_IDS.get(league_code, 39)
+    # Cache key based on the match
+    cache_key = f"analyze_{league_code}_{home_query.lower()}_{away_query.lower()}"
+    cached = cache_get(cache_key)
+    if cached:
+        print(f"[cache HIT] {cache_key}")
+        return jsonify(cached)
+
     result = {}
-
     try:
-        # 1. Get all teams in competition → fuzzy match
-        teams_data = af_get("teams", af_key, {"league": league_id, "season": CURRENT_SEASON})
-        teams = teams_data.get("response", [])
+        # 1. Teams (cached separately)
+        teams_cache_key = f"teams_{league_code}"
+        teams_data = cache_get(teams_cache_key)
+        if not teams_data:
+            teams_data = fd_get(f"competitions/{league_code}/teams")
+            cache_set(teams_cache_key, teams_data)
 
-        ht_item = find_team(teams, home_query)
-        at_item = find_team(teams, away_query)
-        if not ht_item:
-            return jsonify({"error": f'"{home_query}" not found in {league_name}. Try full official name.'}), 404
-        if not at_item:
-            return jsonify({"error": f'"{away_query}" not found in {league_name}. Try full official name.'}), 404
+        teams = teams_data.get("teams", [])
+        ht = find_team(teams, home_query)
+        at = find_team(teams, away_query)
+        if not ht: return jsonify({"error": f'"{home_query}" not found in {league_name}.'}), 404
+        if not at: return jsonify({"error": f'"{away_query}" not found in {league_name}.'}), 404
 
-        ht = {
-            "id":    ht_item["team"]["id"],
-            "name":  ht_item["team"]["name"],
-            "crest": ht_item["team"].get("logo", ""),
-            "shortName": ht_item["team"]["name"],
-        }
-        at = {
-            "id":    at_item["team"]["id"],
-            "name":  at_item["team"]["name"],
-            "crest": at_item["team"].get("logo", ""),
-            "shortName": at_item["team"]["name"],
-        }
-        result.update({
-            "homeTeam":  ht,
-            "awayTeam":  at,
-            "league":    {"id": league_code, "name": league_name},
-            "matchDate": match_date,
-        })
+        result.update({"homeTeam": ht, "awayTeam": at,
+                        "league": {"id": league_code, "name": league_name},
+                        "matchDate": match_date})
 
-        # 2. Standings
+        # 2. Standings (cached)
+        stand_key = f"standings_{league_code}"
+        sd = cache_get(stand_key)
+        if not sd:
+            sd = fd_get(f"competitions/{league_code}/standings")
+            cache_set(stand_key, sd)
         try:
-            sd = af_get("standings", af_key, {"league": league_id, "season": CURRENT_SEASON})
-            standings_list = sd.get("response", [{}])[0].get("league", {}).get("standings", [[]])[0]
-            result["standings"]    = standings_list
-            result["homeStanding"] = next((s for s in standings_list if s["team"]["id"] == ht["id"]), None)
-            result["awayStanding"] = next((s for s in standings_list if s["team"]["id"] == at["id"]), None)
+            rows = next((s.get("table",[]) for s in sd.get("standings",[]) if s.get("type")=="TOTAL"),
+                        (sd.get("standings") or [{}])[0].get("table",[]))
+            result["standings"]    = rows
+            result["homeStanding"] = next((r for r in rows if r["team"]["id"]==ht["id"]), None)
+            result["awayStanding"] = next((r for r in rows if r["team"]["id"]==at["id"]), None)
         except Exception as e:
             print(f"[standings] {e}")
             result["standings"] = result["homeStanding"] = result["awayStanding"] = None
 
-        # 3. Recent fixtures (form)
+        # 3. Recent form (cached per team)
         for key, team in [("home", ht), ("away", at)]:
-            try:
-                fd = af_get("fixtures", af_key, {
-                    "team": team["id"], "season": CURRENT_SEASON,
-                    "status": "FT", "last": 8
-                })
-                fixtures = fd.get("response", [])
-                result[f"{key}Fixtures"] = fixtures
-                result[f"{key}Form"]     = get_form_from_fixtures(fixtures, team["id"])
-                # For backwards compat with chat context builder
-                result[f"{key}Matches"]  = [_fixture_to_match(f) for f in fixtures]
-            except Exception as e:
-                print(f"[form {key}] {e}")
-                result[f"{key}Fixtures"] = []
-                result[f"{key}Form"]     = "N/A"
-                result[f"{key}Matches"]  = []
+            form_key = f"form_{team['id']}"
+            ms = cache_get(form_key)
+            if not ms:
+                fd_data = fd_get(f"teams/{team['id']}/matches",
+                                 {"status":"FINISHED","limit":8})
+                ms = fd_data.get("matches",[])
+                cache_set(form_key, ms)
+            result[f"{key}Matches"] = ms
+            result[f"{key}Form"]    = get_form(ms, team["id"])
 
-        # 4. H2H
-        try:
-            h2h_data = af_get("fixtures/headtohead", af_key, {
-                "h2h": f"{ht['id']}-{at['id']}",
-                "last": 8, "status": "FT"
-            })
-            result["h2h"] = h2h_data.get("response", [])
-        except Exception as e:
-            print(f"[h2h] {e}")
-            result["h2h"] = []
+        # 4. H2H (cached)
+        h2h_key = f"h2h_{min(ht['id'],at['id'])}_{max(ht['id'],at['id'])}"
+        h2h = cache_get(h2h_key)
+        if not h2h:
+            all_m = fd_get(f"teams/{ht['id']}/matches",
+                           {"status":"FINISHED","limit":100}).get("matches",[])
+            ids   = {ht["id"], at["id"]}
+            h2h   = [m for m in all_m
+                     if {m.get("homeTeam",{}).get("id"), m.get("awayTeam",{}).get("id")} == ids][:8]
+            cache_set(h2h_key, h2h)
+        result["h2h"] = h2h
 
-        # 5. Squads
+        # 5. Squads (cached per team)
         for key, team in [("home", ht), ("away", at)]:
-            try:
-                sq = af_get("players/squads", af_key, {"team": team["id"]})
-                players_raw = sq.get("response", [{}])[0].get("players", [])
-                result[f"{key}Players"] = [
-                    {
-                        "name":     p.get("name", ""),
-                        "position": p.get("position", ""),
-                        "nationality": "",
-                        "age":      p.get("age", ""),
-                        "number":   p.get("number", ""),
-                    }
-                    for p in players_raw
-                ]
-            except Exception as e:
-                print(f"[squad {key}] {e}")
-                result[f"{key}Players"] = []
+            sq_key = f"squad_{team['id']}"
+            sq = cache_get(sq_key)
+            if not sq:
+                sq = fd_get(f"teams/{team['id']}").get("squad",[])
+                cache_set(sq_key, sq)
+            result[f"{key}Players"] = sq
 
-        # 6. AI Prediction
-        effective_groq = groq_key or GROQ_API_KEY
-        if use_ai and effective_groq:
+        # 6. AI prediction (Groq)
+        if use_ai and GROQ_API_KEY:
             try:
-                result["aiPrediction"] = ai_predict(result, effective_groq)
+                result["aiPrediction"] = ai_predict(result)
             except Exception as e:
                 print(f"[ai] {e}")
                 result["aiPrediction"] = {"error": str(e)}
         else:
             result["aiPrediction"] = None
 
+        cache_set(cache_key, result)
         return jsonify(result)
 
     except Exception as e:
@@ -518,30 +472,16 @@ def analyze():
         return jsonify({"error": str(e)}), 500
 
 
-def _fixture_to_match(f):
-    """Convert api-football fixture to the shape expected by the chat context builder."""
-    teams = f.get("teams", {})
-    goals = f.get("goals", {})
-    return {
-        "utcDate":  f.get("fixture", {}).get("date", ""),
-        "homeTeam": {"id": teams.get("home", {}).get("id"), "name": teams.get("home", {}).get("name", "")},
-        "awayTeam": {"id": teams.get("away", {}).get("id"), "name": teams.get("away", {}).get("name", "")},
-        "score":    {"fullTime": {"home": goals.get("home"), "away": goals.get("away")}},
-        "competition": {"name": f.get("league", {}).get("name", "")},
-    }
-
-
 @app.route("/api/chat", methods=["POST"])
 def chat():
     body     = request.json or {}
-    groq_key = request.headers.get("X-Groq-Key", "").strip()
     messages = body.get("messages", [])
     system   = body.get("system", "You are a football analytics expert. Be concise and factual.")
     if not messages:
         return jsonify({"error": "No messages"}), 400
     try:
-        full  = [{"role": "system", "content": system}] + messages
-        reply = groq_chat(full, groq_key, temperature=0.2, max_tokens=600, as_json=False)
+        reply = groq_chat([{"role":"system","content":system}]+messages,
+                          temperature=0.2, max_tokens=600, as_json=False)
         return jsonify({"reply": reply})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -551,6 +491,8 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"\n{'='*55}")
     print(f"  ⚽  ScoutAI  —  http://localhost:{port}")
-    print(f"  Data: api-football.com v3 (100 req/day free)")
+    print(f"  Season: {CURRENT_SEASON}")
+    print(f"  FD key:   {'✓ set' if FD_KEY else '✗ missing — set FD_KEY env var'}")
+    print(f"  Groq key: {'✓ set' if GROQ_API_KEY else '✗ missing — set GROQ_API_KEY env var'}")
     print(f"{'='*55}\n")
     app.run(host="0.0.0.0", port=port, debug=False)

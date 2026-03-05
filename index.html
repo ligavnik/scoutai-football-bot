@@ -541,37 +541,12 @@ header{position:sticky;top:0;z-index:100;background:rgba(7,9,15,.93);backdrop-fi
 
 <div class="setup">
 
-  <!-- API Keys -->
-  <div class="api-panel">
-    <div class="api-top">
-      <div class="api-emoji">🔑</div>
-      <div class="api-info">
-        <h3>API Keys — both free, no credit card</h3>
-        <p>
-          <strong>Football data:</strong> <a href="https://dashboard.api-football.com/register" target="_blank">dashboard.api-football.com/register</a> — free, 100 req/day<br>
-          <strong>AI Predictions:</strong> <a href="https://console.groq.com" target="_blank">console.groq.com</a> → API Keys → Create → paste below
-        </p>
-      </div>
-    </div>
-    <div class="api-keys" style="grid-template-columns:1fr 1fr">
-      <div class="api-field">
-        <label>API-FOOTBALL.COM KEY</label>
-        <div class="api-field-row">
-          <input type="text" id="fdKey" placeholder="e.g. abc123def456…" maxlength="64" />
-          <button class="btn-sv" onclick="saveKeys()">SAVE</button>
-        </div>
-      </div>
-      <div class="api-field">
-        <label>GROQ API KEY (free AI predictions)</label>
-        <div class="api-field-row">
-          <input type="password" id="groqKey" placeholder="gsk_…" maxlength="120" />
-          <button class="btn-sv" onclick="saveKeys()">SAVE</button>
-        </div>
-      </div>
-    </div>
+  <!-- Server status bar -->
+  <div class="api-panel" style="padding:12px 22px">
     <div class="status-row">
-      <div class="stext"><div class="sdot" id="fdDot"></div><span id="fdStatus">No football-data.org key</span></div>
-      <div class="stext"><div class="sdot" id="aiDot"></div><span id="aiStatus">No Groq key — AI disabled</span></div>
+      <div class="stext"><div class="sdot" id="fdDot"></div><span id="fdStatus">Connecting…</span></div>
+      <div class="stext"><div class="sdot" id="aiDot"></div><span id="aiStatus">Checking AI…</span></div>
+      <div class="stext" style="margin-left:auto;font-size:9px;color:var(--td)" id="seasonBadge"></div>
     </div>
   </div>
 
@@ -695,24 +670,21 @@ header{position:sticky;top:0;z-index:100;background:rgba(7,9,15,.93);backdrop-fi
 
 <script>
 // ── CONFIG ──────────────────────────────────────────────────────────────────
-const SERVER = '';  // empty = same origin (works locally AND on Railway)
-let FD_KEY   = localStorage.getItem('fdKey')   || '';
-let GROQ_KEY = localStorage.getItem('groqKey') || '';
-let league   = { id: 'PL', name: 'Premier League' };
-let matchData  = {};
+const SERVER = '';  // same origin — works locally and on Railway
+let league      = { id: 'PL', name: 'Premier League' };
+let matchData   = {};
 let chatHistory = [];
 
 // ── INIT ────────────────────────────────────────────────────────────────────
-window.onload = () => {
-  if (FD_KEY)   document.getElementById('fdKey').value   = FD_KEY;
-  if (GROQ_KEY) document.getElementById('groqKey').value = GROQ_KEY;
-  refreshStatus();
+window.onload = async () => {
   setupAutocomplete('homeIn', 'homeAC');
   setupAutocomplete('awayIn', 'awayAC');
   document.getElementById('homeIn').addEventListener('keydown', e => e.key==='Enter' && analyze());
   document.getElementById('awayIn').addEventListener('keydown', e => e.key==='Enter' && analyze());
   document.getElementById('chatIn').addEventListener('keydown', e => e.key==='Enter' && sendChat());
-  if (FD_KEY) fetchTeamsForAC('PL');
+
+  // Check server status
+  await checkServerStatus();
 
   // Always show tabs — default to Fixtures
   document.getElementById('tabs').style.display = 'flex';
@@ -721,40 +693,39 @@ window.onload = () => {
   document.querySelector('[data-p="fixtures"]').classList.add('active');
   document.getElementById('panel-fixtures').classList.add('show');
   document.getElementById('emptyState').style.display = 'none';
-  if (FD_KEY) loadFixtures();
+  loadFixtures();
+  fetchTeamsForAC('PL');
 };
 
-function saveKeys() {
-  FD_KEY   = document.getElementById('fdKey').value.trim();
-  GROQ_KEY = document.getElementById('groqKey').value.trim();
-  localStorage.setItem('fdKey',   FD_KEY);
-  localStorage.setItem('groqKey', GROQ_KEY);
-  refreshStatus();
-  checkReady();
-  if (FD_KEY) fetchTeamsForAC(league.id);
-  if (FD_KEY) loadFixtures();
-}
-
-function refreshStatus() {
-  // Football-data status
-  const fdDot = document.getElementById('fdDot');
-  const fdTxt = document.getElementById('fdStatus');
-  if (FD_KEY) { fdDot.className='sdot ok'; fdTxt.textContent='API-Football key saved ✓'; }
-  else        { fdDot.className='sdot';    fdTxt.textContent='No key — get free key at dashboard.api-football.com'; }
-
-  // Groq status
-  const aiDot = document.getElementById('aiDot');
-  const aiTxt = document.getElementById('aiStatus');
-  if (GROQ_KEY) { aiDot.className='sdot ok'; aiTxt.textContent='Groq AI ready ✓ (llama-3.1-8b-instant)'; }
-  else          { aiDot.className='sdot';    aiTxt.textContent='No Groq key — get free key at console.groq.com'; }
-
-  checkReady();
+async function checkServerStatus() {
+  try {
+    const r = await fetch(`${SERVER}/api/status`);
+    const d = await r.json();
+    const fdDot = document.getElementById('fdDot');
+    const fdTxt = document.getElementById('fdStatus');
+    if (d.fdReady) { fdDot.className='sdot ok'; fdTxt.textContent='Football data ready ✓'; }
+    else           { fdDot.className='sdot err'; fdTxt.textContent='Football data unavailable — check server config'; }
+    const aiDot = document.getElementById('aiDot');
+    const aiTxt = document.getElementById('aiStatus');
+    if (d.groqReady) { aiDot.className='sdot ok'; aiTxt.textContent='AI predictions ready ✓'; }
+    else             { aiDot.className='sdot err'; aiTxt.textContent='AI unavailable — check server config'; }
+    const sb = document.getElementById('seasonBadge');
+    if (sb) {
+      const season = d.season ? `SEASON ${d.season}/${String(d.season+1).slice(2)}` : '';
+      const cached = d.cachedItems > 0 ? ` · ${d.cachedItems} cached` : '';
+      sb.textContent = season + cached;
+    }
+    checkReady();
+  } catch(e) {
+    document.getElementById('fdDot').className = 'sdot err';
+    document.getElementById('fdStatus').textContent = 'Cannot reach server — is it running?';
+  }
 }
 
 function checkReady() {
   const h = document.getElementById('homeIn').value.trim();
   const a = document.getElementById('awayIn').value.trim();
-  document.getElementById('analyzeBtn').disabled = !(FD_KEY && h && a);
+  document.getElementById('analyzeBtn').disabled = !(h && a);
 }
 
 function pickLeague(btn) {
@@ -797,7 +768,7 @@ async function analyze() {
   const home = document.getElementById('homeIn').value.trim();
   const away = document.getElementById('awayIn').value.trim();
   const date = document.getElementById('dateIn').value;
-  if (!FD_KEY || !home || !away) return;
+  if (!home || !away) return;
 
   // Reset UI
   document.getElementById('emptyState').style.display = 'none';
@@ -814,10 +785,9 @@ async function analyze() {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-AF-Key':   FD_KEY,
-        'X-Groq-Key': GROQ_KEY
+        'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ home, away, leagueId: league.id, leagueName: league.name, matchDate: date, useAI: !!GROQ_KEY })
+      body: JSON.stringify({ home, away, leagueId: league.id, leagueName: league.name, matchDate: date, useAI: true })
     });
 
     if (!res.ok) {
@@ -1214,7 +1184,7 @@ ${ctx}
   try {
     const res=await fetch(`${SERVER}/api/chat`,{
       method:'POST',
-      headers:{'Content-Type':'application/json','X-Groq-Key':GROQ_KEY},
+      headers:{'Content-Type':'application/json',},
       body:JSON.stringify({system:sys, messages:chatHistory})
     });
     const dat=await res.json();
@@ -1257,11 +1227,10 @@ let teamsCache = {};          // { leagueId: [teamObjects] }
 let acFocusIdx = { homeIn: -1, awayIn: -1 };
 
 async function fetchTeamsForAC(leagueId) {
-  if (!FD_KEY) return;
   if (teamsCache[leagueId]) return; // already cached
   try {
     const r = await fetch(`${SERVER}/api/teams?league=${leagueId}`, {
-      headers: { 'X-AF-Key': FD_KEY }
+      headers: { 'Content-Type': 'application/json' }
     });
     if (!r.ok) return;
     const d = await r.json();
@@ -1323,7 +1292,7 @@ function renderAC(inputId, listId, query) {
 
   if (!query || query.length < 1) { closeAC(listId); return; }
 
-  if (!teams.length && FD_KEY) {
+  if (!teams.length) {
     lst.innerHTML = '<div class="ac-loading"><div class="ac-spinner"></div> LOADING TEAMS…</div>';
     lst.classList.add('open');
     fetchTeamsForAC(league.id).then(() => renderAC(inputId, listId, query));
@@ -1395,19 +1364,14 @@ function setFixDays(btn) {
 }
 
 async function loadFixtures() {
-  if (!FD_KEY) {
-    document.getElementById('fixturesBody').innerHTML =
-      '<div class="fix-empty">⚠️ Save your API-Football key first.</div>';
-    return;
-  }
-  const body = document.getElementById('fixturesBody');
+   const body = document.getElementById('fixturesBody');
   body.innerHTML = '<div class="fix-loading"><div class="spinner"></div><p>LOADING UPCOMING MATCHES…</p></div>';
   fixturesLoaded = true;
 
   try {
     const r = await fetch(
       `${SERVER}/api/fixtures?days=${fixDays}&leagues=PL,PD,BL1,SA,FL1,CL,EC,WC`,
-      { headers: { 'X-AF-Key': FD_KEY, 'X-Groq-Key': GROQ_KEY } }
+      { headers: { 'Content-Type': 'application/json' } }
     );
     const d = await r.json();
     if (d.error) throw new Error(d.error);
@@ -1567,14 +1531,14 @@ async function openFixturePrediction(match) {
 
     const r = await fetch(`${SERVER}/api/analyze`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-AF-Key': FD_KEY, 'X-Groq-Key': GROQ_KEY },
+      headers: { 'Content-Type': 'application/json', 'Content-Type': 'application/json' },
       body: JSON.stringify({
         home: ht.name,
         away: at.name,
         leagueId: leagueCode,
         leagueName: leagueName,
         matchDate: dateStr,
-        useAI: !!GROQ_KEY
+        useAI: true
       })
     });
     const d = await r.json();
