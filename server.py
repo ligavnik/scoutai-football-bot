@@ -48,7 +48,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
-app = Flask(__name__, static_folder=".")
+app = Flask(__name__, static_folder=os.path.dirname(os.path.abspath(__file__)))
 CORS(app)
 
 # ── SERVER-SIDE KEYS (never exposed to users) ─────────────────────────────────
@@ -291,7 +291,7 @@ Rules: winner = exactly one name or Draw. Probabilities sum to 100."""
 
 @app.route("/")
 def index():
-    return send_from_directory(".", "index.html")
+    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "index.html")
 
 
 @app.route("/api/debug")
