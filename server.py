@@ -19,6 +19,22 @@ RAILWAY DEPLOY:
 """
 
 import json, os, re, time, hashlib, requests
+
+# Auto-load .env file if it exists (for local development)
+def _load_dotenv():
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip(); val = val.strip().strip('"').strip("'")
+            if key and not os.environ.get(key):  # don't override real env vars
+                os.environ[key] = val
+_load_dotenv()
 from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
