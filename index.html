@@ -548,14 +548,14 @@ header{position:sticky;top:0;z-index:100;background:rgba(7,9,15,.93);backdrop-fi
       <div class="api-info">
         <h3>API Keys — both free, no credit card</h3>
         <p>
-          <strong>Football data:</strong> <a href="https://www.football-data.org/client/register" target="_blank">football-data.org/client/register</a><br>
+          <strong>Football data:</strong> <a href="https://dashboard.api-football.com/register" target="_blank">dashboard.api-football.com/register</a> — free, 100 req/day<br>
           <strong>AI Predictions:</strong> <a href="https://console.groq.com" target="_blank">console.groq.com</a> → API Keys → Create → paste below
         </p>
       </div>
     </div>
     <div class="api-keys" style="grid-template-columns:1fr 1fr">
       <div class="api-field">
-        <label>FOOTBALL-DATA.ORG KEY</label>
+        <label>API-FOOTBALL.COM KEY</label>
         <div class="api-field-row">
           <input type="text" id="fdKey" placeholder="e.g. abc123def456…" maxlength="64" />
           <button class="btn-sv" onclick="saveKeys()">SAVE</button>
@@ -739,8 +739,8 @@ function refreshStatus() {
   // Football-data status
   const fdDot = document.getElementById('fdDot');
   const fdTxt = document.getElementById('fdStatus');
-  if (FD_KEY) { fdDot.className='sdot ok'; fdTxt.textContent='football-data.org key saved ✓'; }
-  else        { fdDot.className='sdot';    fdTxt.textContent='No key — get free key at football-data.org'; }
+  if (FD_KEY) { fdDot.className='sdot ok'; fdTxt.textContent='API-Football key saved ✓'; }
+  else        { fdDot.className='sdot';    fdTxt.textContent='No key — get free key at dashboard.api-football.com'; }
 
   // Groq status
   const aiDot = document.getElementById('aiDot');
@@ -814,7 +814,7 @@ async function analyze() {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-FD-Key':   FD_KEY,
+        'X-AF-Key':   FD_KEY,
         'X-Groq-Key': GROQ_KEY
       },
       body: JSON.stringify({ home, away, leagueId: league.id, leagueName: league.name, matchDate: date, useAI: !!GROQ_KEY })
@@ -1261,7 +1261,7 @@ async function fetchTeamsForAC(leagueId) {
   if (teamsCache[leagueId]) return; // already cached
   try {
     const r = await fetch(`${SERVER}/api/teams?league=${leagueId}`, {
-      headers: { 'X-FD-Key': FD_KEY }
+      headers: { 'X-AF-Key': FD_KEY }
     });
     if (!r.ok) return;
     const d = await r.json();
@@ -1397,7 +1397,7 @@ function setFixDays(btn) {
 async function loadFixtures() {
   if (!FD_KEY) {
     document.getElementById('fixturesBody').innerHTML =
-      '<div class="fix-empty">⚠️ Save your football-data.org API key first.</div>';
+      '<div class="fix-empty">⚠️ Save your API-Football key first.</div>';
     return;
   }
   const body = document.getElementById('fixturesBody');
@@ -1407,7 +1407,7 @@ async function loadFixtures() {
   try {
     const r = await fetch(
       `${SERVER}/api/fixtures?days=${fixDays}&leagues=PL,PD,BL1,SA,FL1,CL,EC,WC`,
-      { headers: { 'X-FD-Key': FD_KEY, 'X-Groq-Key': GROQ_KEY } }
+      { headers: { 'X-AF-Key': FD_KEY, 'X-Groq-Key': GROQ_KEY } }
     );
     const d = await r.json();
     if (d.error) throw new Error(d.error);
@@ -1567,7 +1567,7 @@ async function openFixturePrediction(match) {
 
     const r = await fetch(`${SERVER}/api/analyze`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-FD-Key': FD_KEY, 'X-Groq-Key': GROQ_KEY },
+      headers: { 'Content-Type': 'application/json', 'X-AF-Key': FD_KEY, 'X-Groq-Key': GROQ_KEY },
       body: JSON.stringify({
         home: ht.name,
         away: at.name,

@@ -1,17 +1,14 @@
 # ⚽ ScoutAI — Football Analytics & Prediction Bot
 
-> Real match data + AI predictions. 100% free, runs in the browser — no terminal needed.
-
-**Live demo:** `https://yourapp.railway.app` (after deploying)
+> Real match data from api-football.com + AI predictions via Groq. 100% free.
 
 ---
 
 ## Features
-
 - 📅 **Upcoming Fixtures** — click any match for instant AI prediction
 - 📊 **Standings · Form · H2H · Squad**
 - 🔮 **AI Prediction** — winner, scoreline, BTTS, Over 2.5, win %
-- 💬 **Chat** — ask follow-up questions about the match
+- 💬 **Chat** — ask follow-up questions grounded in real data
 
 ---
 
@@ -19,21 +16,17 @@
 
 | Key | Where to get |
 |-----|-------------|
-| Football data | [football-data.org/client/register](https://www.football-data.org/client/register) |
+| Football data | [dashboard.api-football.com/register](https://dashboard.api-football.com/register) — 100 req/day free |
 | AI (Groq) | [console.groq.com](https://console.groq.com) → API Keys → Create |
-
-Enter both keys directly in the app — they're saved in your browser.
 
 ---
 
-## Deploy to Railway (free hosting)
+## Deploy to Railway (share with anyone — no setup needed)
 
-1. Fork this repo on GitHub
-2. Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo**
-3. Select your fork
-4. Done — Railway gives you a public URL like `https://yourapp.railway.app`
-
-That's it. Share the URL with anyone — no setup needed on their end.
+1. Fork this repo
+2. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub
+3. Select your fork → Railway auto-deploys
+4. Share the `https://yourapp.railway.app` URL
 
 ---
 
@@ -44,12 +37,3 @@ pip install -r requirements.txt
 python server.py
 # open http://localhost:5000
 ```
-
----
-
-## Tech stack
-
-- **Backend:** Python / Flask
-- **AI:** Groq API (llama-3.1-8b-instant) — free tier
-- **Football data:** football-data.org — free tier
-- **Hosting:** Railway.app — free tier
