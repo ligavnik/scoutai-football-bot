@@ -51,9 +51,9 @@ from flask_cors import CORS
 app = Flask(__name__, static_folder=os.path.dirname(os.path.abspath(__file__)))
 CORS(app)
 
-# ── SERVER-SIDE KEYS (never exposed to users) ─────────────────────────────────
-FD_KEY       = os.environ.get("FD_KEY", "")        # football-data.org
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")  # groq.com
+# ── SERVER-SIDE KEYS — read fresh each request to avoid load-order issues ────
+def get_fd_key():   return os.environ.get("FD_KEY", "").strip()
+def get_groq_key(): return os.environ.get("GROQ_API_KEY", "").strip()
 
 FD_BASE   = "https://api.football-data.org/v4"
 GROQ_BASE = "https://api.groq.com/openai/v1"
@@ -121,9 +121,9 @@ def cache_set(key, data):
 # ── FOOTBALL-DATA.ORG ─────────────────────────────────────────────────────────
 
 def fd_get(path, params=None):
-    if not FD_KEY:
+    if not get_fd_key():
         raise Exception("No football-data.org key configured on server.")
-    headers = {"X-Auth-Token": FD_KEY}
+    headers = {"X-Auth-Token": get_fd_key()}
     r = requests.get(f"{FD_BASE}/{path.lstrip('/')}", headers=headers,
                      params=params or {}, timeout=12)
     if not r.ok:
@@ -178,9 +178,9 @@ def fmt_recent(matches, team_id, n=5):
 # ── GROQ AI ───────────────────────────────────────────────────────────────────
 
 def groq_chat(messages, temperature=0.3, max_tokens=1400, as_json=True):
-    if not GROQ_API_KEY:
+    if not get_groq_key():
         raise Exception("No Groq API key configured on server.")
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}",
+    headers = {"Authorization": f"Bearer {get_groq_key()}",
                "Content-Type": "application/json"}
     payload = {"model": GROQ_MODEL, "messages": messages,
                "temperature": temperature, "max_tokens": max_tokens}
@@ -293,16 +293,20 @@ Rules: winner = exactly one name or Draw. Probabilities sum to 100."""
 def index():
     return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "index.html")
 
+@app.route("/favicon.ico")
+def favicon():
+    return "", 204  # No content — stops 404 spam
+
 
 @app.route("/api/debug")
 def debug():
     """Shows config state — remove this route before making the app public."""
     cache_files = len(glob.glob(os.path.join(CACHE_DIR, "*.pkl")))
     return jsonify({
-        "FD_KEY_set":       bool(FD_KEY),
-        "FD_KEY_length":    len(FD_KEY) if FD_KEY else 0,
-        "GROQ_KEY_set":     bool(GROQ_API_KEY),
-        "GROQ_KEY_length":  len(GROQ_API_KEY) if GROQ_API_KEY else 0,
+        "FD_KEY_set":       bool(get_fd_key()),
+        "FD_KEY_length":    len(get_fd_key()),
+        "GROQ_KEY_set":     bool(get_groq_key()),
+        "GROQ_KEY_length":  len(get_groq_key()),
         "cwd":              os.getcwd(),
         "env_file_exists":  os.path.exists(os.path.join(os.getcwd(), ".env")),
         "season":           CURRENT_SEASON,
@@ -319,11 +323,11 @@ def status():
         cached_count = 0
 
     return jsonify({
-        "fdReady":    bool(FD_KEY),
-        "groqReady":  bool(GROQ_API_KEY),
+        "fdReady":    bool(get_fd_key()),
+        "groqReady":  bool(get_groq_key()),
         "season":     CURRENT_SEASON,
         "cachedItems": cached_count,
-        "message":    "OK" if FD_KEY and GROQ_API_KEY else "Some keys missing on server"
+        "message":    "OK" if get_fd_key() and get_groq_key() else "Some keys missing on server"
     })
 
 
@@ -406,7 +410,7 @@ def analyze():
 
     if not home_query or not away_query:
         return jsonify({"error": "Both team names required"}), 400
-    if not FD_KEY:
+    if not get_fd_key():
         return jsonify({"error": "Football data key not configured on server."}), 500
 
     # Cache key based on the match
@@ -485,7 +489,7 @@ def analyze():
             result[f"{key}Players"] = sq
 
         # 6. AI prediction (Groq)
-        if use_ai and GROQ_API_KEY:
+        if use_ai and get_groq_key():
             try:
                 result["aiPrediction"] = ai_predict(result)
             except Exception as e:
@@ -522,7 +526,7 @@ if __name__ == "__main__":
     print(f"\n{'='*55}")
     print(f"  ⚽  ScoutAI  —  http://localhost:{port}")
     print(f"  Season: {CURRENT_SEASON}")
-    print(f"  FD key:   {'✓ set' if FD_KEY else '✗ missing — set FD_KEY env var'}")
-    print(f"  Groq key: {'✓ set' if GROQ_API_KEY else '✗ missing — set GROQ_API_KEY env var'}")
+    print(f"  FD key:   {'✓ set' if get_fd_key() else '✗ missing — set FD_KEY env var'}")
+    print(f"  Groq key: {'✓ set' if get_groq_key() else '✗ missing — set GROQ_API_KEY env var'}")
     print(f"{'='*55}\n")
     app.run(host="0.0.0.0", port=port, debug=False)
