@@ -93,7 +93,7 @@ def _cache_ttl(key):
     return 1800
 
 def _cache_file(key):
-    safe = _hl.md5(key.encode()).hexdigest()
+    safe = hashlib.md5(key.encode()).hexdigest()
     return os.path.join(CACHE_DIR, f"{safe}.pkl")
 
 def cache_get(key):
