@@ -350,49 +350,48 @@ def get_teams():
 
 @app.route("/api/fixtures")
 def get_fixtures():
-    days    = int(request.args.get("days", 7))
-    leagues = request.args.get("leagues", "PL,PD,BL1,SA,FL1,CL")
-    cache_key = f"fixtures_{leagues}_{days}_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+    days      = int(request.args.get("days", 7))
+    cache_key = f"fixtures_{days}_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
 
     cached = cache_get(cache_key)
     if cached:
-        print(f"[cache HIT] fixtures")
+        print(f"[cache HIT] fixtures ({cached['count']} matches)")
         return jsonify(cached)
 
     now       = datetime.now(timezone.utc)
     date_from = now.strftime("%Y-%m-%d")
     date_to   = (now + timedelta(days=days)).strftime("%Y-%m-%d")
 
-    all_matches, errors = [], []
-    for code in leagues.split(","):
-        code = code.strip()
-        try:
-            data = fd_get(f"competitions/{code}/matches",
-                          {"status": "SCHEDULED", "dateFrom": date_from, "dateTo": date_to})
-            comp = data.get("competition", {})
-            for m in data.get("matches", []):
-                all_matches.append({
-                    "id":       m.get("id"),
-                    "utcDate":  m.get("utcDate",""),
-                    "status":   m.get("status",""),
-                    "homeTeam": m.get("homeTeam",{}),
-                    "awayTeam": m.get("awayTeam",{}),
-                    "competition": {
-                        "id":     comp.get("id", code),
-                        "code":   comp.get("code", code),
-                        "name":   comp.get("name", code),
-                        "emblem": comp.get("emblem",""),
-                    },
-                    "matchday": m.get("matchday"),
-                })
-            print(f"[fixtures] {code}: {len(data.get('matches',[]))} matches")
-        except Exception as e:
-            errors.append(f"{code}: {e}")
-            print(f"[fixtures ERR] {code}: {e}")
+    # Single API call — returns ALL matches across all subscribed competitions
+    try:
+        data = fd_get("matches", {"dateFrom": date_from, "dateTo": date_to, "status": "SCHEDULED"})
+    except Exception as e:
+        print(f"[fixtures ERR] {e}")
+        return jsonify({"error": str(e), "matches": [], "count": 0}), 400
 
-    all_matches.sort(key=lambda m: m.get("utcDate",""))
+    all_matches = []
+    for m in data.get("matches", []):
+        comp = m.get("competition", {})
+        all_matches.append({
+            "id":       m.get("id"),
+            "utcDate":  m.get("utcDate", ""),
+            "status":   m.get("status", ""),
+            "homeTeam": m.get("homeTeam", {}),
+            "awayTeam": m.get("awayTeam", {}),
+            "competition": {
+                "id":     comp.get("id", ""),
+                "code":   comp.get("code", ""),
+                "name":   comp.get("name", ""),
+                "emblem": comp.get("emblem", ""),
+            },
+            "matchday": m.get("matchday"),
+        })
+
+    all_matches.sort(key=lambda m: m.get("utcDate", ""))
+    print(f"[fixtures] {date_from} → {date_to}: {len(all_matches)} matches total")
+
     result = {"matches": all_matches, "dateFrom": date_from, "dateTo": date_to,
-              "errors": errors, "count": len(all_matches)}
+              "errors": [], "count": len(all_matches)}
     if all_matches:
         cache_set(cache_key, result)
     return jsonify(result)
