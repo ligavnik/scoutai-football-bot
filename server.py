@@ -42,7 +42,10 @@ LEAGUE_IDS = {
     "EC":  4,    # Euro Championship
 }
 
-CURRENT_SEASON = 2024   # update each year
+# Auto-detect season: football seasons run Aug-May
+# e.g. 2024/25 season = 2024, 2025/26 season = 2025
+_now = datetime.now(timezone.utc)
+CURRENT_SEASON = _now.year if _now.month >= 7 else _now.year - 1
 
 
 # ── API-FOOTBALL HELPER ───────────────────────────────────────────────────────
@@ -340,17 +343,22 @@ def get_fixtures():
         try:
             data = af_get("fixtures", af_key, {
                 "league": lid, "season": CURRENT_SEASON,
-                "from": date_from, "to": date_to, "status": "NS"
+                "from": date_from, "to": date_to,
             })
+            total = data.get("results", 0)
+            print(f"[fixtures] {code} season={CURRENT_SEASON} {date_from}→{date_to}: {total} results")
             for f in data.get("response", []):
-                fix  = f.get("fixture", {})
+                fix    = f.get("fixture", {})
+                status = fix.get("status", {}).get("short", "")
+                if status in ("1H","HT","2H","ET","BT","P","INT","FT","AET","PEN","WO","CANC","ABD"):
+                    continue
                 lge  = f.get("league", {})
                 home = f.get("teams", {}).get("home", {})
                 away = f.get("teams", {}).get("away", {})
                 all_matches.append({
                     "id":      fix.get("id"),
                     "utcDate": fix.get("date", ""),
-                    "status":  fix.get("status", {}).get("short", "NS"),
+                    "status":  fix.get("status", {}).get("short", ""),
                     "homeTeam": {
                         "id":    home.get("id"),
                         "name":  home.get("name", ""),
