@@ -18,7 +18,7 @@ RAILWAY DEPLOY:
   Users just open the URL. Zero setup on their end.
 """
 
-import json, os, re, time, hashlib, requests
+import json, os, re, time, hashlib, pickle, glob, requests
 
 # Auto-load .env file — tries multiple locations
 def _load_dotenv():
@@ -78,7 +78,6 @@ LEAGUE_MAP = {
 # ── CACHE ─────────────────────────────────────────────────────────────────────
 # Persistent file-based cache — survives server restarts.
 # Cache folder is /tmp (works on Railway, Heroku, and locally).
-import pickle, hashlib as _hl
 
 CACHE_DIR = "/tmp/scoutai_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -298,7 +297,6 @@ def index():
 @app.route("/api/debug")
 def debug():
     """Shows config state — remove this route before making the app public."""
-    import glob
     cache_files = len(glob.glob(os.path.join(CACHE_DIR, "*.pkl")))
     return jsonify({
         "FD_KEY_set":       bool(FD_KEY),
@@ -315,26 +313,16 @@ def debug():
 @app.route("/api/status")
 def status():
     """Tell the frontend which features are available + cache stats."""
-    # Count cached files and their ages
-    cached_files = []
     try:
-        for f in os.listdir(CACHE_DIR):
-            fp = os.path.join(CACHE_DIR, f)
-            try:
-                with open(fp, "rb") as fh:
-                    ts, _ = pickle.load(fh)
-                age_min = round((time.time() - ts) / 60)
-                cached_files.append(age_min)
-            except Exception:
-                pass
+        cached_count = len(glob.glob(os.path.join(CACHE_DIR, "*.pkl")))
     except Exception:
-        pass
+        cached_count = 0
 
     return jsonify({
         "fdReady":    bool(FD_KEY),
         "groqReady":  bool(GROQ_API_KEY),
         "season":     CURRENT_SEASON,
-        "cachedItems": len(cached_files),
+        "cachedItems": cached_count,
         "message":    "OK" if FD_KEY and GROQ_API_KEY else "Some keys missing on server"
     })
 
