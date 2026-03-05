@@ -20,20 +20,29 @@ RAILWAY DEPLOY:
 
 import json, os, re, time, hashlib, requests
 
-# Auto-load .env file if it exists (for local development)
+# Auto-load .env file — tries multiple locations
 def _load_dotenv():
-    env_path = os.path.join(os.path.dirname(__file__), ".env")
-    if not os.path.exists(env_path):
-        return
-    with open(env_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            key = key.strip(); val = val.strip().strip('"').strip("'")
-            if key and not os.environ.get(key):  # don't override real env vars
-                os.environ[key] = val
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+        os.path.join(os.getcwd(), ".env"),
+        ".env",
+    ]
+    for env_path in candidates:
+        if os.path.exists(env_path):
+            print(f"[.env] Loading from: {env_path}")
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    key = key.strip()
+                    val = val.strip().strip('"').strip("'")
+                    if key and not os.environ.get(key):
+                        os.environ[key] = val
+                        print(f"[.env] Set {key}={'***' if 'KEY' in key else val}")
+            return
+    print("[.env] No .env file found — using environment variables only")
 _load_dotenv()
 from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify, request, send_from_directory
@@ -284,6 +293,23 @@ Rules: winner = exactly one name or Draw. Probabilities sum to 100."""
 @app.route("/")
 def index():
     return send_from_directory(".", "index.html")
+
+
+@app.route("/api/debug")
+def debug():
+    """Shows config state — remove this route before making the app public."""
+    import glob
+    cache_files = len(glob.glob(os.path.join(CACHE_DIR, "*.pkl")))
+    return jsonify({
+        "FD_KEY_set":       bool(FD_KEY),
+        "FD_KEY_length":    len(FD_KEY) if FD_KEY else 0,
+        "GROQ_KEY_set":     bool(GROQ_API_KEY),
+        "GROQ_KEY_length":  len(GROQ_API_KEY) if GROQ_API_KEY else 0,
+        "cwd":              os.getcwd(),
+        "env_file_exists":  os.path.exists(os.path.join(os.getcwd(), ".env")),
+        "season":           CURRENT_SEASON,
+        "cache_files":      cache_files,
+    })
 
 
 @app.route("/api/status")
