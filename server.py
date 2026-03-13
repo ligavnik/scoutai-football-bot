@@ -74,6 +74,66 @@ LEAGUE_MAP = {
     "EC":  {"name": "European Championship", "id": "EC"},
 }
 
+# Understat league names (free xG data, no key needed)
+UNDERSTAT_LEAGUES = {
+    "PL":  "EPL",
+    "PD":  "La_Liga",
+    "BL1": "Bundesliga",
+    "SA":  "Serie_A",
+    "FL1": "Ligue_1",
+}
+
+# football-data.org name → understat name mapping (fuzzy matched at runtime)
+UNDERSTAT_TEAM_MAP = {
+    "Manchester City":      "Manchester City",
+    "Manchester United":    "Manchester United",
+    "Arsenal":              "Arsenal",
+    "Liverpool":            "Liverpool",
+    "Chelsea":              "Chelsea",
+    "Tottenham Hotspur":    "Tottenham",
+    "Newcastle United":     "Newcastle United",
+    "Aston Villa":          "Aston Villa",
+    "Brighton & Hove Albion": "Brighton",
+    "West Ham United":      "West Ham",
+    "Brentford":            "Brentford",
+    "Fulham":               "Fulham",
+    "Wolverhampton Wanderers": "Wolverhampton Wanderers",
+    "Nottingham Forest":    "Nottingham Forest",
+    "Everton":              "Everton",
+    "Crystal Palace":       "Crystal Palace",
+    "Bournemouth":          "Bournemouth",
+    "Leicester City":       "Leicester",
+    "Ipswich Town":         "Ipswich",
+    "Southampton":          "Southampton",
+    "Real Madrid":          "Real Madrid",
+    "FC Barcelona":         "Barcelona",
+    "Atletico Madrid":      "Atletico Madrid",
+    "Sevilla FC":           "Sevilla",
+    "Real Betis":           "Real Betis",
+    "Athletic Club":        "Athletic Club",
+    "Villarreal CF":        "Villarreal",
+    "Real Sociedad":        "Real Sociedad",
+    "Bayern München":       "Bayern Munich",
+    "Borussia Dortmund":    "Dortmund",
+    "RB Leipzig":           "RB Leipzig",
+    "Bayer 04 Leverkusen":  "Bayer Leverkusen",
+    "Eintracht Frankfurt":  "Eintracht Frankfurt",
+    "VfB Stuttgart":        "Stuttgart",
+    "Juventus":             "Juventus",
+    "AC Milan":             "Milan",
+    "Inter Milan":          "Internazionale",
+    "SSC Napoli":           "Napoli",
+    "AS Roma":              "Roma",
+    "Lazio":                "Lazio",
+    "Atalanta BC":          "Atalanta",
+    "Fiorentina":           "Fiorentina",
+    "Paris Saint-Germain":  "Paris Saint-Germain",
+    "Olympique de Marseille": "Marseille",
+    "Olympique Lyonnais":   "Lyon",
+    "AS Monaco":            "Monaco",
+    "LOSC Lille":           "Lille",
+}
+
 
 # ── CACHE ─────────────────────────────────────────────────────────────────────
 # Persistent file-based cache — survives server restarts.
@@ -175,6 +235,115 @@ def fmt_recent(matches, team_id, n=5):
     return "\n".join(lines) if lines else "  No data"
 
 
+# ── UNDERSTAT (free xG data — no API key) ────────────────────────────────────
+
+def get_understat_team_xg(fd_team_name, league_code):
+    """
+    Scrape season xG stats for a team from understat.com.
+    Returns dict with xG, xGA, xPTS, ppda, deep, scored, missed or None on failure.
+    Cached 6 hours — understat updates once daily.
+    """
+    us_league = UNDERSTAT_LEAGUES.get(league_code)
+    if not us_league:
+        return None
+
+    # Map football-data name to understat name
+    us_name = UNDERSTAT_TEAM_MAP.get(fd_team_name)
+    if not us_name:
+        # Try fuzzy: strip common suffixes and match
+        short = fd_team_name.replace(" FC","").replace(" CF","").replace(" AC","").strip()
+        for fd, us in UNDERSTAT_TEAM_MAP.items():
+            if short.lower() in fd.lower() or fd.lower() in short.lower():
+                us_name = us
+                break
+    if not us_name:
+        print(f"[understat] no name map for '{fd_team_name}'")
+        return None
+
+    cache_key = f"xg_{us_league}_{CURRENT_SEASON}"
+    league_xg = cache_get(cache_key)
+
+    if not league_xg:
+        try:
+            url = f"https://understat.com/league/{us_league}/{CURRENT_SEASON}"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            r = requests.get(url, headers=headers, timeout=15)
+            if not r.ok:
+                print(f"[understat] HTTP {r.status_code} for {url}")
+                return None
+
+            # Extract teamsData JSON from script tag
+            match = re.search(r"var teamsData\s*=\s*JSON\.parse\('(.+?)'\)", r.text)
+            if not match:
+                print(f"[understat] teamsData not found in page")
+                return None
+
+            raw = match.group(1).encode().decode("unicode_escape")
+            teams_data = json.loads(raw)
+            league_xg = {}
+
+            for team_id, team_info in teams_data.items():
+                title = team_info.get("title", "")
+                history = team_info.get("history", [])
+                if not history:
+                    continue
+                # Sum up the season stats
+                xg  = sum(float(m.get("xG",  0)) for m in history)
+                xga = sum(float(m.get("xGA", 0)) for m in history)
+                scored  = sum(int(m.get("scored",  0)) for m in history)
+                missed  = sum(int(m.get("missed",  0)) for m in history)
+                xpts    = sum(float(m.get("xpts",  0)) for m in history)
+                deep    = sum(int(m.get("deep",    0)) for m in history)
+                deep_a  = sum(int(m.get("deep_allowed", 0)) for m in history)
+                # PPDA: passes per defensive action (lower = more pressing)
+                ppda_att = sum(float(m.get("ppda", {}).get("att", 0)) for m in history)
+                ppda_def = sum(float(m.get("ppda", {}).get("def", 1)) for m in history)
+                ppda = round(ppda_att / ppda_def, 2) if ppda_def else None
+                games = len(history)
+
+                league_xg[title] = {
+                    "xG":      round(xg,  2),
+                    "xGA":     round(xga, 2),
+                    "xGD":     round(xg - xga, 2),
+                    "xPTS":    round(xpts, 1),
+                    "xG_per":  round(xg  / games, 2) if games else 0,
+                    "xGA_per": round(xga / games, 2) if games else 0,
+                    "scored":  scored,
+                    "missed":  missed,
+                    "deep":    deep,
+                    "deep_a":  deep_a,
+                    "ppda":    ppda,
+                    "games":   games,
+                    # Over/under-performance
+                    "xG_diff":  round(scored - xg,  2),
+                    "xGA_diff": round(xga - missed, 2),
+                }
+
+            # Cache 6 hours — understat updates once daily
+            _cache[f"xg_{us_league}_{CURRENT_SEASON}"] = (time.time() - (3600 * 18), league_xg)  # placeholder
+            cache_key2 = f"xg_{us_league}_{CURRENT_SEASON}"
+            cache_set(cache_key2, league_xg)
+            league_xg = league_xg  # use the freshly built dict
+            print(f"[understat] fetched {len(league_xg)} teams for {us_league} {CURRENT_SEASON}")
+
+        except Exception as e:
+            print(f"[understat] ERROR: {e}")
+            return None
+
+    # Find the team in the league data
+    # Try exact match first, then fuzzy
+    team_data = league_xg.get(us_name)
+    if not team_data:
+        for title, data in league_xg.items():
+            if us_name.lower() in title.lower() or title.lower() in us_name.lower():
+                team_data = data
+                break
+    if not team_data:
+        print(f"[understat] '{us_name}' not found in {us_league} data. Available: {list(league_xg.keys())[:5]}")
+
+    return team_data
+
+
 # ── GROQ AI ───────────────────────────────────────────────────────────────────
 
 def groq_chat(messages, temperature=0.3, max_tokens=1400, as_json=True):
@@ -212,77 +381,221 @@ def extract_json(text):
 
 # ── AI PREDICTION ─────────────────────────────────────────────────────────────
 
+def fmt_h2h_detail(matches, home_id, away_id):
+    lines, home_w, away_w, draws = [], 0, 0, 0
+    total_goals = []
+    for m in matches[:8]:
+        ft  = m.get("score",{}).get("fullTime",{})
+        hg  = ft.get("home"); ag = ft.get("away")
+        if hg is None or ag is None: continue
+        is_home = m.get("homeTeam",{}).get("id") == home_id
+        gs  = hg if is_home else ag
+        gc  = ag if is_home else hg
+        opp = m.get("awayTeam" if is_home else "homeTeam",{}).get("name","?")
+        date = m.get("utcDate","")[:10]
+        total = hg + ag
+        total_goals.append(total)
+        if gs > gc:   home_w += 1; res = "WIN"
+        elif gs < gc: away_w += 1; res = "LOSS"
+        else:         draws  += 1; res = "DRAW"
+        lines.append(f"  {res} {gs}-{gc} vs {opp} ({date}) — {total} goals total")
+    avg_goals = round(sum(total_goals)/len(total_goals), 1) if total_goals else "?"
+    summary = f"  Record (last {len(lines)}): {home_w}W {draws}D {away_w}L | Avg goals/game: {avg_goals}"
+    return "\n".join([summary] + lines) if lines else "  No H2H data"
+
+
+def fmt_recent_deep(matches, team_id, n=8):
+    lines = []
+    home_pts = away_pts = home_g = away_g = 0
+    home_n = away_n = 0
+    for m in reversed(matches[:n]):
+        is_home = m.get("homeTeam",{}).get("id") == team_id
+        ft  = m.get("score",{}).get("fullTime",{})
+        hg  = ft.get("home","?"); ag = ft.get("away","?")
+        gs  = hg if is_home else ag
+        gc  = ag if is_home else hg
+        opp = m.get("awayTeam" if is_home else "homeTeam",{}).get("name","?")
+        venue = "H" if is_home else "A"
+        date  = m.get("utcDate","")[:10]
+        try:
+            res = "W" if int(gs)>int(gc) else "L" if int(gs)<int(gc) else "D"
+            pts = 3 if res=="W" else 1 if res=="D" else 0
+            if is_home: home_pts += pts; home_g += int(gs); home_n += 1
+            else:       away_pts += pts; away_g += int(gs); away_n += 1
+        except: res = "?"
+        lines.append(f"  [{venue}] {res} {gs}-{gc} vs {opp} ({date})")
+    home_avg = round(home_g/home_n,1) if home_n else "?"
+    away_avg = round(away_g/away_n,1) if away_n else "?"
+    split = f"  Home: {home_pts}pts/{home_n}g ({home_avg} goals/g) | Away: {away_pts}pts/{away_n}g ({away_avg} goals/g)"
+    return "\n".join([split] + lines) if lines else "  No data"
+
+
+def calc_avg_goals(matches, team_id, n=8):
+    scored = conceded = count = 0
+    for m in matches[:n]:
+        is_home = m.get("homeTeam",{}).get("id") == team_id
+        ft = m.get("score",{}).get("fullTime",{})
+        hg = ft.get("home"); ag = ft.get("away")
+        if hg is None or ag is None: continue
+        scored   += hg if is_home else ag
+        conceded += ag if is_home else hg
+        count    += 1
+    if not count: return None, None
+    return round(scored/count, 2), round(conceded/count, 2)
+
+
 def ai_predict(data):
     home_name = data["homeTeam"]["name"]
     away_name = data["awayTeam"]["name"]
     hs  = data.get("homeStanding") or {}
     as_ = data.get("awayStanding") or {}
+    hxg = data.get("homeXG") or {}
+    axg = data.get("awayXG") or {}
+    league_name = data.get("league",{}).get("name","?")
 
-    h2h_lines = []
-    for m in data.get("h2h", [])[:6]:
-        ft = m.get("score",{}).get("fullTime",{})
-        h2h_lines.append(
-            f"  {m.get('homeTeam',{}).get('name','?')} "
-            f"{ft.get('home','?')}-{ft.get('away','?')} "
-            f"{m.get('awayTeam',{}).get('name','?')} "
-            f"({m.get('utcDate','')[:10]})"
-        )
-    h2h_txt      = "\n".join(h2h_lines) or "  No H2H data"
-    home_recent  = fmt_recent(data.get("homeMatches",[]), data["homeTeam"]["id"])
-    away_recent  = fmt_recent(data.get("awayMatches",[]), data["awayTeam"]["id"])
+    home_matches = data.get("homeMatches", [])
+    away_matches = data.get("awayMatches", [])
+    h2h_matches  = data.get("h2h", [])
 
-    prompt = f"""Analyze this match and return your single definitive prediction as JSON.
+    home_scored_avg, home_conceded_avg = calc_avg_goals(home_matches, data["homeTeam"]["id"])
+    away_scored_avg, away_conceded_avg = calc_avg_goals(away_matches, data["awayTeam"]["id"])
+
+    h2h_detail  = fmt_h2h_detail(h2h_matches, data["homeTeam"]["id"], data["awayTeam"]["id"])
+    home_recent = fmt_recent_deep(home_matches, data["homeTeam"]["id"])
+    away_recent = fmt_recent_deep(away_matches, data["awayTeam"]["id"])
+
+    def xg_block(name, xg, standing):
+        if not xg:
+            return f"{name} xG: No data available"
+        diff = xg.get("xG_diff", 0)
+        if   diff > 2:   over_under = f"OVERPERFORMING xG by +{diff} goals — regression risk, real strength may be lower"
+        elif diff > 1:   over_under = f"Slightly overperforming xG by +{diff} goals"
+        elif diff < -2:  over_under = f"UNDERPERFORMING xG by {diff} goals — positive regression likely, better than results show"
+        elif diff < -1:  over_under = f"Slightly underperforming xG by {diff} goals"
+        else:            over_under = f"Performing in line with xG"
+        ppda = xg.get("ppda")
+        if   ppda and ppda < 8:  pressing = f"VERY HIGH pressing (PPDA:{ppda} — elite press, creates chaos)"
+        elif ppda and ppda < 11: pressing = f"High pressing (PPDA:{ppda})"
+        elif ppda and ppda < 14: pressing = f"Moderate pressing (PPDA:{ppda})"
+        elif ppda:               pressing = f"Low pressing / passive block (PPDA:{ppda})"
+        else:                    pressing = "Pressing data unavailable"
+        xgd = xg.get("xGD", 0)
+        if   xgd > 20: dom = "completely dominant"
+        elif xgd > 10: dom = "strong"
+        elif xgd > 3:  dom = "slight edge"
+        elif xgd > -3: dom = "evenly matched"
+        elif xgd > -10: dom = "under pressure"
+        else:           dom = "struggling badly"
+        return (f"{name}:\n"
+                f"  xG/game: {xg['xG_per']} | xGA/game: {xg['xGA_per']} | Season xGD: {xgd} ({dom})\n"
+                f"  {xg.get('scored','?')} goals scored vs {xg['xG']} xG expected — {over_under}\n"
+                f"  Deep passes: {xg.get('deep','?')} | {pressing}\n"
+                f"  Expected pts: {xg.get('xPTS','?')} vs actual {standing.get('points','?')} pts")
+
+    # Implied goals: blend xG attack vs opponent xG defense
+    def implied(att_xg, att_avg, def_xg, def_avg):
+        vals = []
+        if att_xg: vals.append(att_xg)
+        if att_avg: vals.append(att_avg)
+        if def_xg: vals.append(def_xg)
+        if def_avg: vals.append(def_avg)
+        return round(sum(vals)/len(vals), 2) if vals else "?"
+
+    h_exp = implied(hxg.get("xG_per"), home_scored_avg,
+                    axg.get("xGA_per"), away_conceded_avg)
+    a_exp = implied(axg.get("xG_per"), away_scored_avg,
+                    hxg.get("xGA_per"), home_conceded_avg)
+
+    prompt = f"""You are an elite football data analyst. Analyze this match deeply and return a SPECIFIC, DATA-DRIVEN prediction. Use the implied goals to determine the realistic scoreline — do NOT default to generic 2-1.
 
 MATCH: {home_name} (HOME) vs {away_name} (AWAY)
-Competition: {data["league"]["name"]}
+Competition: {league_name}
 
-{home_name}: #{hs.get("position","?")} | P{hs.get("playedGames","?")} W{hs.get("won","?")} D{hs.get("draw","?")} L{hs.get("lost","?")} | GF:{hs.get("goalsFor","?")} GA:{hs.get("goalsAgainst","?")} | Pts:{hs.get("points","?")} | Form:{data.get("homeForm","?")}
-Last 5:\n{home_recent}
+━━━ LEAGUE TABLE ━━━
+{home_name}: #{hs.get("position","?")} | {hs.get("playedGames","?")} played | {hs.get("won","?")}W {hs.get("draw","?")}D {hs.get("lost","?")}L | GF:{hs.get("goalsFor","?")} GA:{hs.get("goalsAgainst","?")} | {hs.get("points","?")} pts | Form: {data.get("homeForm","?")}
+{away_name}: #{as_.get("position","?")} | {as_.get("playedGames","?")} played | {as_.get("won","?")}W {as_.get("draw","?")}D {as_.get("lost","?")}L | GF:{as_.get("goalsFor","?")} GA:{as_.get("goalsAgainst","?")} | {as_.get("points","?")} pts | Form: {data.get("awayForm","?")}
 
-{away_name}: #{as_.get("position","?")} | P{as_.get("playedGames","?")} W{as_.get("won","?")} D{as_.get("draw","?")} L{as_.get("lost","?")} | GF:{as_.get("goalsFor","?")} GA:{as_.get("goalsAgainst","?")} | Pts:{as_.get("points","?")} | Form:{data.get("awayForm","?")}
-Last 5:\n{away_recent}
+━━━ xG ANALYTICS (most important data) ━━━
+{xg_block(home_name, hxg, hs)}
 
-H2H:\n{h2h_txt}
+{xg_block(away_name, axg, as_)}
+
+IMPLIED EXPECTED GOALS THIS MATCH:
+  {home_name} likely to score: ~{h_exp} goals
+  {away_name} likely to score: ~{a_exp} goals
+  Total expected: ~{round(h_exp + a_exp, 1) if isinstance(h_exp, float) and isinstance(a_exp, float) else "?"} goals
+
+━━━ RECENT FORM — LAST 8 MATCHES ━━━
+{home_name}:
+{home_recent}
+
+{away_name}:
+{away_recent}
+
+━━━ HEAD TO HEAD ━━━
+{h2h_detail}
+
+━━━ SCORING AVERAGES (last 8 games) ━━━
+{home_name}: {home_scored_avg} scored / {home_conceded_avg} conceded per game
+{away_name}: {away_scored_avg} scored / {away_conceded_avg} conceded per game
+
+━━━ YOUR ANALYSIS TASK ━━━
+Before predicting, reason through:
+1. xG advantage: which team creates better quality chances?
+2. Regression: is either team over/underperforming xG? Expect correction.
+3. Defensive strength: compare xGA/game and goals conceded averages.
+4. Form trajectory: is either team trending up or down?
+5. H2H patterns: does this fixture tend to be high/low scoring? Who dominates?
+6. Scoreline: use implied goals ({h_exp} vs {a_exp}) to pick a REALISTIC score.
 
 Return ONLY this JSON:
 {{
   "winner": "EXACTLY {home_name} OR {away_name} OR Draw",
-  "score": "2-1",
+  "score": "realistic scoreline based on implied goals above — e.g. 1-0, 2-0, 1-1, 0-0, 3-1 etc.",
   "confidence": "High or Medium or Low",
   "btts": "Yes or No",
   "over25": "Yes or No",
-  "winProbHome": 45,
-  "winProbDraw": 25,
-  "winProbAway": 30,
-  "keyFactor": "single most decisive reason",
-  "analysis": "200 word expert analysis, direct and confident",
-  "homeStrengths": ["data-based strength","strength","strength"],
-  "awayStrengths": ["data-based strength","strength","strength"],
-  "riskFactor": "what could make this prediction wrong"
+  "winProbHome": 0,
+  "winProbDraw": 0,
+  "winProbAway": 0,
+  "keyFactor": "most statistically significant factor from the data",
+  "xgInsight": "one sentence on what xG reveals that raw results hide",
+  "scoringPattern": "low-scoring defensive battle / open attacking game / one-sided etc.",
+  "analysis": "350+ word expert analysis with specific numbers. Cover: xG comparison, PPDA/pressing, form, H2H, implied goals, regression risk. Be direct and confident.",
+  "homeStrengths": ["stat-backed strength", "stat-backed strength", "stat-backed strength"],
+  "awayStrengths": ["stat-backed strength", "stat-backed strength", "stat-backed strength"],
+  "riskFactor": "specific data-driven reason this prediction could be wrong"
 }}
-Rules: winner = exactly one name or Draw. Probabilities sum to 100."""
+
+RULES: winner = exact name or Draw. Probabilities sum to 100. Score must reflect ~{h_exp} vs ~{a_exp} implied goals."""
 
     raw = groq_chat([
-        {"role":"system","content":"You are a professional football analyst. Pick ONE definitive winner. Return only valid JSON."},
-        {"role":"user","content":prompt}
-    ])
+        {"role": "system", "content": (
+            "You are a professional football statistician and analyst. "
+            "You base every prediction on xG data, form, and implied goals calculations. "
+            "You never default to generic scorelines like 2-1 — you always use the data. "
+            "You return only valid JSON with no extra text."
+        )},
+        {"role": "user", "content": prompt}
+    ], temperature=0.4, max_tokens=2000)
+
     result = extract_json(raw)
 
-    # Safety: validate winner
     valid = [home_name, away_name, "Draw"]
     if result.get("winner") not in valid:
-        ph = result.get("winProbHome",0)
-        pa = result.get("winProbAway",0)
-        pd = result.get("winProbDraw",0)
+        ph = result.get("winProbHome", 0)
+        pa = result.get("winProbAway", 0)
+        pd = result.get("winProbDraw", 0)
         result["winner"] = home_name if ph>=pa and ph>=pd else away_name if pa>=ph and pa>=pd else "Draw"
 
-    # Normalize probabilities
-    ph,pd,pa = int(result.get("winProbHome",40)), int(result.get("winProbDraw",25)), int(result.get("winProbAway",35))
-    total = ph+pd+pa
-    if total != 100:
-        result["winProbHome"] = round(ph*100/total)
-        result["winProbDraw"] = round(pd*100/total)
-        result["winProbAway"] = 100-result["winProbHome"]-result["winProbDraw"]
+    ph = int(result.get("winProbHome", 40))
+    pd_v = int(result.get("winProbDraw", 25))
+    pa = int(result.get("winProbAway", 35))
+    total = ph + pd_v + pa
+    if total != 100 and total > 0:
+        result["winProbHome"]  = round(ph * 100 / total)
+        result["winProbDraw"]  = round(pd_v * 100 / total)
+        result["winProbAway"]  = 100 - result["winProbHome"] - result["winProbDraw"]
 
     return result
 
@@ -487,7 +800,16 @@ def analyze():
                 cache_set(sq_key, sq)
             result[f"{key}Players"] = sq
 
-        # 6. AI prediction (Groq)
+        # 6. xG data from Understat (free, no key needed)
+        for key, team in [("home", ht), ("away", at)]:
+            xg_data = get_understat_team_xg(team.get("name",""), league_code)
+            result[f"{key}XG"] = xg_data
+            if xg_data:
+                print(f"[understat] {team['name']}: xG/g={xg_data['xG_per']} xGA/g={xg_data['xGA_per']} ppda={xg_data['ppda']}")
+            else:
+                print(f"[understat] no xG data for {team['name']}")
+
+        # 7. AI prediction (Groq)
         if use_ai and get_groq_key():
             try:
                 result["aiPrediction"] = ai_predict(result)
